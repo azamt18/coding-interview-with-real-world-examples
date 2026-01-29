@@ -43,6 +43,48 @@
         set/get/delete  | O(1) time | O(1) space
         t = transactions count
 
+    Part 3: nested transaction support
+        consider:
+            1. child transaction inherits parent state
+            2. changes in child transactions are visible to that child
+            3. when child commits, its changes merged into parent
+            4. when child rollbacks, its changes are discarded, parent is unaffected
+            5. when parent rollbacks, all child changes are discarded
+            6. only outermost transaction commits do changes to global store
+
+        key design: stack of transaction layers
+
+            transaction 3 <-- current/innermost
+            -------------
+            transaction 2
+            -------------
+            transaction 1
+            -------------
+            global store
+
+            writes: always to top of stack
+            reads: search from bottom, return first match
+            commits: pop top and merge into layer below
+            rollbacks: pop top and discard
+
+    Follow-ups:
+        1. thread-safe
+            a. global lock: simple, but limits concurrency
+            b. read-write lock: allow concurrent reads, exclusive writes
+            c. per-transaction isolation: each thread gets its own transaction
+        2. persistence
+            a. wal (write-ahead log) for durability
+            b. snapshot + wal for recovery
+            c. background flushing for performance
+        3. memory limits
+            a. LRU eviction policy
+            b. disk-backed storage with memory cache
+            c. compression for cold data
+        4. transaction timeout
+            a. add timeout param to begin()
+            b. background thread to abort long-running transactions
+            c. resource cleanup on timeout
+
 """
 import unittest
 
@@ -51,64 +93,84 @@ class Database:
     _DELETED = object()
 
     def __init__(self):
-        self.store: dict[str, str] = {}
-        self._transaction: dict[str, str | object] | None = None
+        self._store: dict[str, str] = {}
+        self._transaction_stack: list[dict[str, str | object]] = []
+
+    def get_current_transaction(self) -> dict[str, str | object] | None:
+        return self._transaction_stack[-1] if self._transaction_stack else None
 
     def set(self, key: str, val: str) -> None:
-        if self._transaction:
-            self._transaction[key] = val
+        current_transaction = self.get_current_transaction()
+        if current_transaction:
+            current_transaction[key] = val
         else:
-            self.store[key] = val
+            self._store[key] = val
 
     def get(self, key: str) -> str | None:
-        if self._transaction:
-            if key in self._transaction:
-                val = self._transaction[key]
+        """ search key from newest (top) to oldest (bottom) """
+        for transaction in reversed(self._transaction_stack):
+            if key in transaction:
+                val = transaction[key]
                 # check if key was deleted in transaction
                 if val is self._DELETED:
                     return None
                 return val
             return None
-        else:
-            if key not in self.store:
-                return None
-            return self.store[key]
+        # full search from global store
+        return self._store[key]
 
     def delete(self, key: str) -> bool:
-        """ Delete key. Returns True if key existed, False otherwise """
+        """ delete key in current transaction """
         # check if key exists including transaction layer
-        exists = self.store.get(key) is not None
-        if self._transaction:
-            # mark
-            self._transaction[key] = self._DELETED
+        exists = self.get(key) is not None
+        current_transaction = self.get_current_transaction()
+
+        if current_transaction:
+            # mark for soft delete
+            current_transaction[key] = self._DELETED
         else:
-            del self.store[key]
+            if key in self._store:
+                del self._store[key]
+
         return exists
 
     def begin(self) -> None:
-        """ init a new transaction """
-        self._transaction = {}
+        """ start a new nested transaction """
+        self._transaction_stack.append({})
 
     def commit(self) -> RuntimeError | None:
-        """ commit the current transaction """
-        if self._transaction is None:
+        """ commit the current transaction
+            - if inner: merge into parent transaction
+            - if outermost: merge into global store
+        """
+
+        if self._transaction_stack is None:
             return RuntimeError("No active transaction")
-        # apply all changes to global store
-        for key, val in self._transaction.items():
-            if val in self._DELETED:
-                self.store.pop(key, None)
-            else:
-                self.store[key] = val
-        self._transaction = None
+
+        current_transaction = self._transaction_stack.pop()
+        if self._transaction_stack:
+            # inner -> merge into parent
+            parent = self._transaction_stack[-1]
+            for key, val in current_transaction.items():
+                parent[key] = val
+        else:
+            # outermost -> merge into global store
+            for key, val in current_transaction.items():
+                if val in self._DELETED:
+                    self._store.pop(key, None)
+                else:
+                    self._store[key] = val
         return None
 
     def rollback(self) -> RuntimeError | None:
-        if self._transaction is None:
+        """ rollback current transaction, discard its changes """
+        if self._transaction_stack is None:
             return RuntimeError("No active transaction")
-        self._transaction = None
+        self._transaction_stack.pop()
         return None
 
     def test_set_and_get(self):
+        """ test function """
         db = Database()
         db.set("foo", "bar")
         assert db.get("foo") == "bar"
